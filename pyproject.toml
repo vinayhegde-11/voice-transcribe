@@ -1,0 +1,19 @@
+[project]
+name = "voice-transcribe"
+version = "1.0.0"
+description = "Offline voice transcription app for Linux"
+requires-python = ">=3.8"
+dependencies = [
+    "PyQt5>=5.15.0",
+    "sounddevice>=0.4.6",
+    "scipy>=1.10.0",
+    "numpy>=1.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/voice-transcribe"
+Repository = "https://github.com/YOUR_USERNAME/voice-transcribe"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
