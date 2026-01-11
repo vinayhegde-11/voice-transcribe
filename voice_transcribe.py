@@ -11,14 +11,26 @@ import subprocess
 import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import sounddevice as sd
 import scipy.io.wavfile as wav
 from PyQt5.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QAction, 
                              QVBoxLayout, QWidget, QPushButton, 
                              QHBoxLayout, QMessageBox, QDialog, QLabel,
                              QCheckBox, QGroupBox)
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QEvent
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QEvent, QFileSystemWatcher, QTimer
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QPainter, QKeySequence
+
+# Constants
+ICON_SIZE = 64
+ICON_COLORS = {
+    'ready': '#F44336',      # Red - ready to record
+    'recording': '#4CAF50',  # Green - recording
+    'processing': '#FFC107'  # Yellow - processing
+}
+MIN_SAMPLE_RATE = 8000
+MAX_SAMPLE_RATE = 48000
+DEFAULT_SAMPLE_RATE = 16000
 
 class TranscriptionSignals(QObject):
     finished = pyqtSignal(str)
@@ -37,24 +49,66 @@ class ConfigManager:
         default_config = {
             'hotkeys_enabled': False,
             'hotkeys': ['F9', 'Alt+.'],
-            'sample_rate': 16000,
+            'sample_rate': DEFAULT_SAMPLE_RATE,
             'whisper_model': 'base',
             'whisper_path': str(Path.home() / 'whisper.cpp'),
             'max_recordings': 5
         }
         
         if self.config_file.exists():
-            with open(self.config_file, 'r') as f:
-                loaded = json.load(f)
-                # Migrate old config format
-                if 'hotkey' in loaded:
-                    loaded['hotkeys'] = [loaded.pop('hotkey')]
-                if 'hotkey_enabled' in loaded:
-                    loaded['hotkeys_enabled'] = loaded.pop('hotkey_enabled')
-                self.config = {**default_config, **loaded}
+            try:
+                with open(self.config_file, 'r') as f:
+                    loaded = json.load(f)
+                    # Migrate old config format
+                    if 'hotkey' in loaded:
+                        loaded['hotkeys'] = [loaded.pop('hotkey')]
+                    if 'hotkey_enabled' in loaded:
+                        loaded['hotkeys_enabled'] = loaded.pop('hotkey_enabled')
+                    self.config = {**default_config, **loaded}
+            except (json.JSONDecodeError, Exception) as e:
+                print(f"Config load error: {e}, using defaults")
+                self.config = default_config
         else:
             self.config = default_config
-            self.save_config()
+        
+        # Validate and fix config
+        self.validate_config()
+        self.save_config()
+    
+    def validate_config(self):
+        """Validate configuration values and fix invalid ones"""
+        # Validate sample_rate
+        if not isinstance(self.config['sample_rate'], int) or \
+           self.config['sample_rate'] < MIN_SAMPLE_RATE or \
+           self.config['sample_rate'] > MAX_SAMPLE_RATE:
+            print(f"Invalid sample_rate: {self.config['sample_rate']}, using default")
+            self.config['sample_rate'] = DEFAULT_SAMPLE_RATE
+        
+        # Validate max_recordings
+        if not isinstance(self.config['max_recordings'], int) or \
+           self.config['max_recordings'] < 1:
+            print(f"Invalid max_recordings: {self.config['max_recordings']}, using 5")
+            self.config['max_recordings'] = 5
+        
+        # Validate whisper_path exists
+        whisper_path = Path(self.config['whisper_path'])
+        if not whisper_path.exists():
+            print(f"Warning: Whisper path does not exist: {whisper_path}")
+            # Try default location
+            default_path = Path.home() / 'whisper.cpp'
+            if default_path.exists():
+                print(f"Using default path: {default_path}")
+                self.config['whisper_path'] = str(default_path)
+        
+        # Validate hotkeys is a list
+        if not isinstance(self.config['hotkeys'], list):
+            self.config['hotkeys'] = ['F9', 'Alt+.']
+        
+        # Validate whisper_model
+        valid_models = ['tiny', 'base', 'small', 'medium', 'large']
+        if self.config['whisper_model'] not in valid_models:
+            print(f"Invalid model: {self.config['whisper_model']}, using base")
+            self.config['whisper_model'] = 'base'
     
     def save_config(self):
         with open(self.config_file, 'w') as f:
@@ -246,14 +300,44 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, 'Removed', f'Removed hotkey: {removed}')
     
     def check_system_conflict(self, hotkey):
-        """Check if hotkey might conflict with system shortcuts"""
-        # Common system shortcuts that might conflict
-        system_shortcuts = [
-            'Ctrl+Alt+T', 'Ctrl+Alt+L', 'Super+L', 'Alt+F1', 'Alt+F2',
-            'Alt+F4', 'Ctrl+Alt+D', 'Super+D', 'Alt+Tab', 'Super+Tab'
-        ]
-        return hotkey in system_shortcuts
-    
+        """Check if hotkey conflicts with actual system shortcuts"""
+        try:
+            # Query all GNOME keybindings
+            result = subprocess.run([
+                'gsettings', 'list-recursively',
+                'org.gnome.desktop.wm.keybindings'
+            ], capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0:
+                # Convert our format to GNOME format for comparison
+                gnome_format = self.app.convert_to_gnome_format(hotkey)
+                
+                # Check if our hotkey appears in any binding
+                if gnome_format.lower() in result.stdout.lower():
+                    return True
+            
+            # Also check media keys
+            result = subprocess.run([
+                'gsettings', 'list-recursively',
+                'org.gnome.settings-daemon.plugins.media-keys'
+            ], capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0:
+                gnome_format = self.app.convert_to_gnome_format(hotkey)
+                if gnome_format.lower() in result.stdout.lower():
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Could not check system conflicts: {e}")
+            # Fallback to hardcoded list
+            system_shortcuts = [
+                'Ctrl+Alt+T', 'Ctrl+Alt+L', 'Super+L', 'Alt+F1', 'Alt+F2',
+                'Alt+F4', 'Ctrl+Alt+D', 'Super+D', 'Alt+Tab', 'Super+Tab'
+            ]
+            return hotkey in system_shortcuts
+        
     def save_settings(self):
         old_enabled = self.config_manager.config['hotkeys_enabled']
         old_hotkeys = self.config_manager.config['hotkeys'].copy()
@@ -279,19 +363,8 @@ class SettingsDialog(QDialog):
 
 class VoiceTranscribeApp(QSystemTrayIcon):
     def __init__(self):
-        # Create a circular colored icon - RED (idle/ready)
-        from PyQt5.QtGui import QPainter
-        
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor('#F44336'))  # Red - ready to record
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 60, 60)
-        painter.end()
-        icon = QIcon(pixmap)
-        
+        # Create initial icon
+        icon = self.create_icon('ready')
         super().__init__(icon)
         
         self.config = ConfigManager()
@@ -302,6 +375,10 @@ class VoiceTranscribeApp(QSystemTrayIcon):
         self.signals.finished.connect(self.on_transcription_finished)
         self.signals.error.connect(self.on_transcription_error)
         self.hotkey_ids = []
+        
+        # Thread pool for transcription (limit to 1 concurrent transcription)
+        self.transcription_executor = ThreadPoolExecutor(max_workers=1)
+        self.processing = False
         
         # Setup IPC for hotkey communication
         self.ipc_file = self.config.config_dir / 'hotkey_trigger'
@@ -327,28 +404,37 @@ class VoiceTranscribeApp(QSystemTrayIcon):
         self.setContextMenu(self.menu)
         self.activated.connect(self.on_tray_activated)
         
+        # Set tooltip
+        self.setToolTip('Voice Transcribe - Ready')
+        
         self.show()
         
         # Register hotkeys if enabled
         if self.config.config['hotkeys_enabled']:
             self.register_hotkeys()
     
+    def create_icon(self, state):
+        """Create a circular icon with the specified color state"""
+        color = ICON_COLORS.get(state, ICON_COLORS['ready'])
+        pixmap = QPixmap(ICON_SIZE, ICON_SIZE)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(color))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(2, 2, ICON_SIZE - 4, ICON_SIZE - 4)
+        painter.end()
+        return QIcon(pixmap)
+    
     def setup_ipc_watcher(self):
         """Setup file watcher for IPC communication"""
-        from PyQt5.QtCore import QTimer, QFileSystemWatcher
-        
         # Ensure IPC file doesn't exist at start
         if self.ipc_file.exists():
             self.ipc_file.unlink()
         
-        # Watch the directory for file changes
+        # Watch the directory for file changes (event-driven, no polling)
         self.file_watcher = QFileSystemWatcher([str(self.config.config_dir)])
         self.file_watcher.directoryChanged.connect(self.check_ipc_trigger)
-        
-        # Also poll periodically as backup
-        self.ipc_timer = QTimer()
-        self.ipc_timer.timeout.connect(self.check_ipc_trigger)
-        self.ipc_timer.start(500)  # Check every 500ms
     
     def check_ipc_trigger(self):
         """Check if hotkey was triggered via IPC"""
@@ -358,8 +444,11 @@ class VoiceTranscribeApp(QSystemTrayIcon):
                 self.ipc_file.unlink()
                 # Toggle recording
                 self.toggle_recording()
-            except:
+            except FileNotFoundError:
+                # File was already deleted, ignore
                 pass
+            except Exception as e:
+                print(f"IPC error: {e}")
     
     def register_hotkeys(self):
         """Register hotkeys with GNOME"""
@@ -527,66 +616,80 @@ class VoiceTranscribeApp(QSystemTrayIcon):
             self.toggle_recording()
     
     def toggle_recording(self):
+        # Don't allow toggling while processing
+        if self.processing:
+            return
+        
         if not self.recording:
             self.start_recording()
         else:
             self.stop_recording()
     
     def start_recording(self):
-        from PyQt5.QtGui import QPainter
-        
         self.recording = True
         self.audio_data = []
         
-        # Change icon color to green circle (recording)
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor('#4CAF50'))  # Green - recording
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 60, 60)
-        painter.end()
-        self.setIcon(QIcon(pixmap))
+        # Change icon to green (recording)
+        self.setIcon(self.create_icon('recording'))
+        self.setToolTip('Voice Transcribe - Recording')
         
         self.record_action.setText('Stop Recording')
         
         def audio_callback(indata, frames, time, status):
             if status:
-                print(status)
+                print(f"Audio status: {status}")
             self.audio_data.append(indata.copy())
         
-        self.stream = sd.InputStream(
-            samplerate=self.config.config['sample_rate'],
-            channels=1,
-            callback=audio_callback
-        )
-        self.stream.start()
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.config.config['sample_rate'],
+                channels=1,
+                callback=audio_callback
+            )
+            self.stream.start()
+        except Exception as e:
+            self.recording = False
+            self.setIcon(self.create_icon('ready'))
+            self.setToolTip('Voice Transcribe - Ready')
+            self.record_action.setText('Start Recording')
+            
+            error_msg = str(e)
+            if 'PortAudio' in error_msg or 'device' in error_msg.lower():
+                self.show_notification('Microphone Error', 
+                    'Could not access microphone. Please check:\n'
+                    '• Microphone is connected\n'
+                    '• Permissions are granted\n'
+                    '• No other app is using it')
+            else:
+                self.show_notification('Recording Error', f'Failed to start recording: {error_msg}')
     
     def stop_recording(self):
-        from PyQt5.QtGui import QPainter
-        
         self.recording = False
         
         if self.stream:
             self.stream.stop()
             self.stream.close()
         
-        # Change icon to yellow circle (processing)
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor('#FFC107'))  # Yellow - processing
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 60, 60)
-        painter.end()
-        self.setIcon(QIcon(pixmap))
+        # Change icon to yellow (processing)
+        self.setIcon(self.create_icon('processing'))
+        self.setToolTip('Voice Transcribe - Processing')
         
         self.record_action.setText('Start Recording')
+        self.record_action.setEnabled(False)  # Disable while processing
         
-        # Save audio and start transcription in background
-        threading.Thread(target=self.process_audio, daemon=True).start()
+        # Check if we have any audio data
+        if not self.audio_data:
+            self.show_notification('Recording Error', 'No audio recorded. Recording was too short.')
+            self.setIcon(self.create_icon('ready'))
+            self.setToolTip('Voice Transcribe - Ready')
+            self.record_action.setEnabled(True)
+            return
+        
+        # Mark as processing
+        self.processing = True
+        
+        # Submit to thread pool (ensures only 1 concurrent transcription)
+        self.transcription_executor.submit(self.process_audio)
     
     def process_audio(self):
         try:
@@ -615,11 +718,19 @@ class VoiceTranscribeApp(QSystemTrayIcon):
             model_path = whisper_path / 'models' / f'ggml-{self.config.config["whisper_model"]}.bin'
             
             if not main_binary.exists():
-                self.signals.error.emit(f'Whisper binary not found at {main_binary}')
+                self.signals.error.emit(
+                    f'Whisper binary not found.\n\n'
+                    f'Expected location: {main_binary}\n\n'
+                    f'Please check Settings and verify Whisper.cpp path.'
+                )
                 return
             
             if not model_path.exists():
-                self.signals.error.emit(f'Model not found at {model_path}')
+                self.signals.error.emit(
+                    f'Whisper model not found.\n\n'
+                    f'Expected: {model_path}\n\n'
+                    f'Try running: cd ~/whisper.cpp && bash ./models/download-ggml-model.sh base'
+                )
                 return
             
             result = subprocess.run(
@@ -639,47 +750,54 @@ class VoiceTranscribeApp(QSystemTrayIcon):
                 if text:
                     self.signals.finished.emit(text)
                 else:
-                    self.signals.error.emit('No speech detected')
+                    self.signals.error.emit(
+                        'No speech detected in recording.\n\n'
+                        'Tips:\n'
+                        '• Speak closer to the microphone\n'
+                        '• Check microphone volume\n'
+                        '• Reduce background noise'
+                    )
             else:
-                self.signals.error.emit(f'Transcription failed: {result.stderr}')
+                error_detail = result.stderr.strip() if result.stderr else 'Unknown error'
+                self.signals.error.emit(
+                    f'Transcription failed.\n\n'
+                    f'Error: {error_detail}\n\n'
+                    f'This usually means the audio file is corrupted or Whisper encountered an issue.'
+                )
                 
         except Exception as e:
-            self.signals.error.emit(f'Error: {str(e)}')
+            import traceback
+            error_detail = traceback.format_exc()
+            print(f"Processing error: {error_detail}")
+            self.signals.error.emit(
+                f'Unexpected error during processing:\n\n{str(e)}\n\n'
+                f'Check terminal for details.'
+            )
     
     def on_transcription_finished(self, text):
-        from PyQt5.QtGui import QPainter
-        
         # Copy to clipboard
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
         
         # Change icon back to red (ready)
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor('#F44336'))  # Red - ready
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 60, 60)
-        painter.end()
-        self.setIcon(QIcon(pixmap))
+        self.setIcon(self.create_icon('ready'))
+        self.setToolTip('Voice Transcribe - Ready')
+        
+        # Re-enable recording
+        self.processing = False
+        self.record_action.setEnabled(True)
     
     def on_transcription_error(self, error_msg):
-        from PyQt5.QtGui import QPainter
-        
         # Show error notification (only for errors)
         self.show_notification('Error', error_msg)
         
         # Change icon back to red (ready)
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor('#F44336'))  # Red - ready
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(2, 2, 60, 60)
-        painter.end()
-        self.setIcon(QIcon(pixmap))
+        self.setIcon(self.create_icon('ready'))
+        self.setToolTip('Voice Transcribe - Ready')
+        
+        # Re-enable recording
+        self.processing = False
+        self.record_action.setEnabled(True)
     
     def show_settings(self):
         dialog = SettingsDialog(self.config, self)
@@ -689,6 +807,10 @@ class VoiceTranscribeApp(QSystemTrayIcon):
         # Unregister hotkeys on quit
         if self.config.config['hotkeys_enabled']:
             self.unregister_hotkeys()
+        
+        # Shutdown thread pool gracefully
+        self.transcription_executor.shutdown(wait=False)
+        
         QApplication.quit()
 
 def main():
