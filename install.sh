@@ -156,6 +156,22 @@ cd "$INSTALL_DIR"
 # Make script executable
 chmod +x voice_transcribe.py
 
+# Create toggle script for hotkeys
+echo "Creating hotkey toggle script..."
+cat > "$INSTALL_DIR/toggle.sh" << 'EOF'
+#!/bin/bash
+# Toggle script for Voice Transcribe hotkeys
+# Sends D-Bus signal to running app
+
+qdbus com.voicetranscribe.app / Toggle 2>/dev/null || \
+dbus-send --session --type=method_call \
+  --dest=com.voicetranscribe.app \
+  / \
+  com.voicetranscribe.app.Toggle 2>/dev/null
+EOF
+
+chmod +x "$INSTALL_DIR/toggle.sh"
+
 # Create config directory and default config
 mkdir -p "$HOME/.config/voice-transcribe"
 if [ ! -f "$HOME/.config/voice-transcribe/config.json" ]; then
